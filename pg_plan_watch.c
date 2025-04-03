@@ -17,7 +17,10 @@
 #include "commands/explain_state.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parsetree.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "pg_plan_watch",
@@ -25,7 +28,7 @@ PG_MODULE_MAGIC_EXT(
 );
 
 /* GUC variables */
-static int	pg_plan_watch_log_min_duration = -1; /* msec or -1 */
+static int	pg_plan_watch_log_seqscan_threshold = -1;	/* tuples */
 static int	pg_plan_watch_log_parameter_max_length = -1; /* bytes or -1 */
 static bool pg_plan_watch_log_analyze = false;
 static bool pg_plan_watch_log_verbose = false;
@@ -64,7 +67,7 @@ static const struct config_enum_entry loglevel_options[] = {
 static int	nesting_level = 0;
 
 #define pg_plan_watch_enabled() \
-	(pg_plan_watch_log_min_duration >= 0 && \
+	(pg_plan_watch_log_seqscan_threshold >= 0 && \
 	 (nesting_level == 0 || pg_plan_watch_log_nested_statements))
 
 /* Saved hook values */
@@ -80,6 +83,7 @@ static void explain_ExecutorRun(QueryDesc *queryDesc,
 static void explain_ExecutorFinish(QueryDesc *queryDesc);
 static void explain_ExecutorEnd(QueryDesc *queryDesc);
 
+static bool DetectSeqScanOverLimit(PlanState *planstate, void *context);
 
 /*
  * Module load callback
@@ -88,14 +92,14 @@ void
 _PG_init(void)
 {
 	/* Define custom GUC variables. */
-	DefineCustomIntVariable("pg_plan_watch.log_min_duration",
-							"Sets the minimum execution time above which plans will be logged.",
-							"-1 disables logging plans. 0 means log all plans.",
-							&pg_plan_watch_log_min_duration,
+	DefineCustomIntVariable("pg_plan_watch.log_seqscan_threshold",
+							"Sets the minimum tuples produced by seqscans which plans will be logged.",
+							"-1 turns this feature off. 0 prints all plans that contains seqscan node.",
+							&pg_plan_watch_log_seqscan_threshold,
 							-1,
 							-1, INT_MAX,
 							PGC_SUSET,
-							GUC_UNIT_MS,
+							0,
 							NULL,
 							NULL,
 							NULL);
@@ -259,6 +263,10 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			if (pg_plan_watch_log_wal)
 				queryDesc->instrument_options |= INSTRUMENT_WAL;
 		}
+
+		/* We need to know number of processed rows per node */
+		if (pg_plan_watch_log_seqscan_threshold >= 0 && (eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+			queryDesc->instrument_options |= INSTRUMENT_ROWS;
 	}
 
 	if (prev_ExecutorStart)
@@ -355,7 +363,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		 */
 		InstrEndLoop(queryDesc->totaltime);
 
-		if (true)
+		if (DetectSeqScanOverLimit(queryDesc->planstate, NULL))
 		{
 			ExplainState *es = NewExplainState();
 
@@ -410,4 +418,23 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+/*
+ * Return true if there is at least one plan node where the number of
+ * returned tuples exceeds the configured threshold.
+ */
+static bool
+DetectSeqScanOverLimit(PlanState *planstate, void *context)
+{
+	if (planstate->instrument)
+		InstrEndLoop(planstate->instrument);
+
+	/* Check this node */
+	if (planstate->instrument &&
+		planstate->instrument->ntuples >= pg_plan_watch_log_seqscan_threshold)
+		return true;
+
+	/* Recursively check child nodes */
+	return planstate_tree_walker(planstate, DetectSeqScanOverLimit, context);
 }
